@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDownUp, ChevronDown, ChevronUp } from 'lucide-react';
-import type { CompClass, Competitor, Course } from '../types/sportident';
+import type { CompClass, Competitor, Course, SIStation } from '../types/sportident';
 import {
   formatDurationMmSs,
   formatSecondsAsClock,
@@ -18,6 +18,20 @@ function getLiveRunningTimeSec(startTimeSec: number | null, nowMs: number): numb
   return elapsedSec >= 0 ? elapsedSec : null;
 }
 
+function getLiveLegTimeSec(
+  startTimeSec: number | null,
+  lastPunchTimeSec: number | null,
+  nowMs: number
+): number | null {
+  const now = new Date(nowMs);
+  const currentClockSec = now.getHours() * 3600 + now.getMinutes() * 60 + now.getSeconds();
+  const baseline = lastPunchTimeSec ?? startTimeSec;
+  if (baseline === null) return null;
+  const difference = currentClockSec - baseline;
+  const elapsedSec = difference < -12 * 3600 ? difference + 86400 : difference;
+  return elapsedSec >= 0 ? elapsedSec : null;
+}
+
 interface SplitsAnalysisTableProps {
   classes: CompClass[];
   courses: Course[];
@@ -28,6 +42,10 @@ interface SplitsAnalysisTableProps {
   onInspectRunner?: (runner: Competitor) => void;
   liveUpdates?: boolean;
   liveUpdateScope?: string;
+  radioControls?: Pick<
+    SIStation,
+    'stationCode' | 'name' | 'stationFunction' | 'active'
+  >[];
 }
 
 export function SplitsAnalysisTable({
@@ -40,6 +58,7 @@ export function SplitsAnalysisTable({
   onInspectRunner,
   liveUpdates = false,
   liveUpdateScope,
+  radioControls = [],
 }: SplitsAnalysisTableProps) {
   const [detailedView, setDetailedView] = useState(false);
   // Sort per class by control order (null = official result order, -1 = sort by total bomtid, >0 = leg order)
@@ -179,7 +198,22 @@ export function SplitsAnalysisTable({
           const isForked = cls.classFormat === 'FORKED';
           const course = courses.find((c) => c.id === cls.courseId) ?? null;
           const inClass = competitors.filter((c) => c.classId === cls.id);
-          const hasRadioControls = inClass.some((c) => c.radioSplits.length > 0);
+          const configuredRadioControls = radioControls
+            .filter(
+              (station) =>
+                station.active &&
+                (station.stationFunction === 'RADIO' ||
+                  station.stationFunction === 'PREWARNING') &&
+                course?.controls.includes(station.stationCode)
+            )
+            .sort(
+              (a, b) =>
+                (course?.controls.indexOf(a.stationCode) ?? 0) -
+                (course?.controls.indexOf(b.stationCode) ?? 0)
+            );
+          const hasRadioControls =
+            configuredRadioControls.length > 0 ||
+            inClass.some((competitor) => competitor.radioSplits.length > 0);
 
           const officialTimed = inClass
             .filter(
@@ -424,6 +458,32 @@ export function SplitsAnalysisTable({
                               nowMs
                             )
                           : r.runningTimeSec;
+                        const passedRadioSplits = [...r.radioSplits].sort(
+                          (a, b) => a.punchTimeSec - b.punchTimeSec
+                        );
+                        const lastPassedConfiguredRadioIndex = passedRadioSplits.reduce(
+                          (lastIndex, split) =>
+                            Math.max(
+                              lastIndex,
+                              configuredRadioControls.findIndex(
+                                (station) => station.stationCode === split.controlCode
+                              )
+                            ),
+                          -1
+                        );
+                        const nextRadioControl = configuredRadioControls.find(
+                          (_, index) => index > lastPassedConfiguredRadioIndex
+                        );
+                        const liveLegTimeSec =
+                          isRunning && hasRadioControls
+                            ? getLiveLegTimeSec(
+                                r.startTimeSec ?? r.allocatedStartSec,
+                                passedRadioSplits.length > 0
+                                  ? passedRadioSplits[passedRadioSplits.length - 1].punchTimeSec
+                                  : null,
+                                nowMs
+                              )
+                            : null;
                         const diff =
                           (timedIdx !== -1 || isRunning) &&
                           leaderSec !== null &&
@@ -515,14 +575,24 @@ export function SplitsAnalysisTable({
 
                             {detailedView && hasRadioControls && (
                               <td className="py-1.5 px-2 text-right font-mono tabular-nums text-slate-600 dark:text-slate-400 whitespace-nowrap">
-                                {r.radioSplits.length > 0
-                                  ? r.radioSplits
+                                <div>
+                                  {passedRadioSplits.length > 0
+                                  ? passedRadioSplits
                                       .map(
                                         (split) =>
                                           `(${split.controlCode}) ${formatDurationMmSs(split.runningTimeSec)}`
                                       )
                                       .join(' · ')
                                   : '—'}
+                                </div>
+                                {liveLegTimeSec !== null && (
+                                  <div className="mt-0.5 font-semibold text-amber-700 dark:text-amber-400">
+                                    {nextRadioControl
+                                      ? `Nästa (${nextRadioControl.stationCode})`
+                                      : 'Mål'}{' '}
+                                    {formatDurationMmSs(liveLegTimeSec)}
+                                  </div>
+                                )}
                               </td>
                             )}
 
@@ -602,6 +672,14 @@ export function SplitsAnalysisTable({
 
                             <td className="py-1.5 px-2 text-right font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-100 whitespace-nowrap">
                               {formatDurationMmSs(displayedTimeSec)}
+                              {!detailedView && liveLegTimeSec !== null && (
+                                <div className="mt-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-400">
+                                  {nextRadioControl
+                                    ? `Nästa (${nextRadioControl.stationCode})`
+                                    : 'Mål'}{' '}
+                                  {formatDurationMmSs(liveLegTimeSec)}
+                                </div>
+                              )}
                             </td>
 
                             <td className="hidden sm:table-cell py-1.5 px-2 text-right font-mono tabular-nums text-slate-500 dark:text-slate-400 whitespace-nowrap">

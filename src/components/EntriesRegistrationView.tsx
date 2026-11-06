@@ -1,11 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
-  Database,
-  Download,
   Search,
   Trash2,
-  Upload,
   UserCheck,
   UserPlus,
 } from 'lucide-react';
@@ -28,9 +25,21 @@ import type {
   SerialConnectionStatus,
   UsbStationMode,
 } from '../services/sportidentWebSerial';
-import { exportRunnerDbCsv, parseRunnerDbCsvOrXml } from '../utils/iofXml';
 import { RunnerStatusIndicator } from './StatusLabels';
 import { UsbStationBar, UsbStationErrorBanner } from './UsbStationBar';
+
+function formatRunnerSource(source: RunnerDbSource): string {
+  switch (source) {
+    case 'EVENTOR_API':
+      return 'Eventor API';
+    case 'EVENTOR_XML':
+      return 'Eventor XML';
+    case 'MEOS_CSV':
+      return 'MeOS CSV';
+    case 'LEARNED_ENTRY':
+      return 'Sparad vid anmälan';
+  }
+}
 
 interface EntriesRegistrationViewProps {
   classes: CompClass[];
@@ -74,30 +83,8 @@ interface EntriesRegistrationViewProps {
   ) => Promise<string | null>;
   onUpdateCompetitor: (id: string, patch: Partial<Competitor>) => Promise<void>;
   onDeleteCompetitor: (id: string) => Promise<void>;
-  onImportRunnerDb: (
-    runners: {
-      siNumber: number;
-      fullName: string;
-      club: string;
-      birthYear?: number | null;
-      defaultClassName?: string | null;
-    }[],
-    source: RunnerDbSource
-  ) => Promise<{ importedCount: number; totalRunnerDb: number }>;
-  onDeleteRunnerDbEntry: (id: string) => Promise<void>;
-}
-
-function formatRunnerSource(source: RunnerDbSource): string {
-  switch (source) {
-    case 'EVENTOR_API':
-      return 'Eventor API';
-    case 'EVENTOR_XML':
-      return 'Eventor XML';
-    case 'MEOS_CSV':
-      return 'MeOS CSV';
-    case 'LEARNED_ENTRY':
-      return 'Sparad vid anmälan';
-  }
+  initialSiNumber?: number | null;
+  onInitialSiNumberConsumed?: () => void;
 }
 
 export function EntriesRegistrationView({
@@ -121,8 +108,8 @@ export function EntriesRegistrationView({
   onCreateCompetitor,
   onUpdateCompetitor,
   onDeleteCompetitor,
-  onImportRunnerDb,
-  onDeleteRunnerDbEntry,
+  initialSiNumber,
+  onInitialSiNumberConsumed,
 }: EntriesRegistrationViewProps) {
   const [siInput, setSiInput] = useState('');
   const [fullName, setFullName] = useState('');
@@ -138,6 +125,8 @@ export function EntriesRegistrationView({
   const [error, setError] = useState<string | null>(null);
   const [successNotice, setSuccessNotice] = useState<string | null>(null);
   const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const lastAutoFilledSiRef = useRef<number | null>(null);
 
   const rentalFeeExtra = clubSettings?.rentalCardFeeSek ?? 30;
   const defaultEntryFee = clubSettings?.defaultDirectEntryFeeSek ?? 100;
@@ -173,12 +162,14 @@ export function EntriesRegistrationView({
     }
   }, [classes, classId]);
 
-  const [listMode, setListMode] = useState<'competitors' | 'runnerDb'>('competitors');
-  const [search, setSearch] = useState('');
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [dbFeedback, setDbFeedback] = useState<string | null>(null);
+  useEffect(() => {
+    if (initialSiNumber === undefined || initialSiNumber === null) return;
+    lastAutoFilledSiRef.current = null;
+    setSiInput(String(initialSiNumber));
+    onInitialSiNumberConsumed?.();
+  }, [initialSiNumber, onInitialSiNumberConsumed]);
 
-  const lastAutoFilledSiRef = useRef<number | null>(null);
+  const [search, setSearch] = useState('');
 
   const numericSiInput = useMemo(() => {
     const cleaned = siInput.replace(/\D/g, '');
@@ -324,29 +315,6 @@ export function EntriesRegistrationView({
     }
   };
 
-  const handleRunnerDbFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      const text = await file.text();
-      const parsed = parseRunnerDbCsvOrXml(text);
-      if (parsed.length === 0) {
-        setDbFeedback(
-          'Hittade inga giltiga rader med SI-bricknummer. Använd Eventor CompetitorList XML eller CSV (SI;Namn;Klubb).'
-        );
-      } else {
-        const isXml = text.trim().startsWith('<');
-        const res = await onImportRunnerDb(parsed, isXml ? 'EVENTOR_XML' : 'MEOS_CSV');
-        setDbFeedback(
-          `Importerade ${res.importedCount} löpare med SI-bricka till Löpardatabasen (totalt ${res.totalRunnerDb} poster).`
-        );
-      }
-    } catch (err: unknown) {
-      setDbFeedback(err instanceof Error ? err.message : 'Kunde inte läsa filen.');
-    }
-    e.target.value = '';
-  };
-
   const filteredCompetitors = useMemo(() => {
     const q = search.trim().toLowerCase();
     if (!q) return competitors;
@@ -358,18 +326,6 @@ export function EntriesRegistrationView({
         String(c.bib).includes(q)
     );
   }, [competitors, search]);
-
-  const filteredRunnerDb = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return runnerDb;
-    return runnerDb.filter(
-      (r) =>
-        r.fullName.toLowerCase().includes(q) ||
-        r.club.toLowerCase().includes(q) ||
-        String(r.siNumber).includes(q) ||
-        (r.defaultClassName?.toLowerCase().includes(q) ?? false)
-    );
-  }, [runnerDb, search]);
 
   const selectNameSuggestion = (runner: RunnerDbEntry) => {
     setFullName(runner.fullName);
@@ -411,20 +367,15 @@ export function EntriesRegistrationView({
     }
   };
 
-  const enteredSiSet = useMemo(
-    () => new Set(competitors.map((c) => c.siNumber)),
-    [competitors]
-  );
-
   return (
     <div className="space-y-3.5">
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5">
         <div>
           <h1 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
-            Direktanmälan & Löpardatabas (Eventor)
+            Direktanmälan
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400">
-            Doppa löparens SI-bricka i ansluten station eller sök i klubbens löpardatabas.
+            Anmäl löpare till den aktuella tävlingen och hantera tävlingsspecifika uppgifter.
           </p>
         </div>
 
@@ -745,84 +696,25 @@ export function EntriesRegistrationView({
         </form>
       </section>
 
-      {/* Segmented Table: Entered Competitors vs MeOS/Eventor Runner Database */}
+      {/* Current competition entries */}
       <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden">
         <div className="px-3.5 py-2.5 border-b border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-2.5">
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="inline-flex items-center gap-1 p-0.5 bg-slate-100 dark:bg-slate-800 rounded-lg">
-              <button
-                type="button"
-                onClick={() => setListMode('competitors')}
-                className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                  listMode === 'competitors'
-                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-sm'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                }`}
-              >
-                Anmälda ({competitors.length})
-              </button>
-              <button
-                type="button"
-                onClick={() => setListMode('runnerDb')}
-                className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
-                  listMode === 'runnerDb'
-                    ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-slate-100 shadow-sm'
-                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
-                }`}
-              >
-                <Database className="w-3.5 h-3.5" />
-                <span>Löpardatabas ({runnerDb.length})</span>
-              </button>
-            </div>
-
-            {listMode === 'runnerDb' && (
-              <div className="flex flex-wrap items-center gap-1.5">
-                <label className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg cursor-pointer whitespace-nowrap">
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>Importera</span>
-                  <input
-                    type="file"
-                    accept=".csv,.txt,.xml,text/csv,text/xml,application/xml"
-                    onChange={handleRunnerDbFileUpload}
-                    className="hidden"
-                  />
-                </label>
-                <button
-                  type="button"
-                  onClick={() => exportRunnerDbCsv(runnerDb)}
-                  className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg whitespace-nowrap"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>CSV</span>
-                </button>
-              </div>
-            )}
-          </div>
-
+          <span className="text-xs font-medium text-slate-700 dark:text-slate-200">
+            Anmälda ({competitors.length})
+          </span>
           <div className="relative w-full lg:w-64">
             <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
             <input
               type="search"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder={
-                listMode === 'competitors'
-                  ? 'Sök anmäld deltagare, klubb, SI...'
-                  : 'Sök i Löpardatabas / Eventor...'
-              }
+              placeholder="Sök anmäld deltagare, klubb, SI..."
               className="w-full pl-8 pr-2.5 py-1 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg"
             />
           </div>
         </div>
 
-        {dbFeedback && listMode === 'runnerDb' && (
-          <div className="px-3.5 py-2 bg-slate-50 dark:bg-slate-950/60 border-b border-slate-200 dark:border-slate-800 text-xs text-slate-700 dark:text-slate-300">
-            {dbFeedback}
-          </div>
-        )}
-
-        {listMode === 'competitors' ? (
-          <div>
+        <div>
             <table className="w-full text-left border-collapse text-xs">
               <thead>
                 <tr className="border-b border-slate-200 dark:border-slate-800 text-[11px] font-medium text-slate-500 dark:text-slate-400 bg-slate-50/70 dark:bg-slate-950/40">
@@ -962,97 +854,6 @@ export function EntriesRegistrationView({
               </tbody>
             </table>
           </div>
-        ) : (
-          <div>
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 dark:border-slate-800 text-[11px] font-medium text-slate-500 dark:text-slate-400 bg-slate-50/70 dark:bg-slate-950/40">
-                  <th className="py-2 pl-3.5 pr-2">SI-bricka</th>
-                  <th className="py-2 px-2">Löpare & Klubb</th>
-                  <th className="hidden sm:table-cell py-2 px-2">Klass</th>
-                  <th className="hidden md:table-cell py-2 px-2">Källa</th>
-                  <th className="py-2 pl-2 pr-3.5 text-right">Åtgärd</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-200/80 dark:divide-slate-800/80">
-                {filteredRunnerDb.map((r) => {
-                  const isEntered = enteredSiSet.has(r.siNumber);
-                  return (
-                    <tr
-                      key={r.id}
-                      className="hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors"
-                    >
-                      <td className="py-1.5 pl-3.5 pr-2 font-mono tabular-nums whitespace-nowrap">
-                        <span className="font-medium text-slate-900 dark:text-slate-100">
-                          {formatSiNumber(r.siNumber)}
-                        </span>
-                        <span className="hidden sm:inline text-slate-400 mx-1" aria-hidden="true">
-                          ·
-                        </span>
-                        <span className="hidden sm:inline font-sans text-slate-500 dark:text-slate-400">
-                          {r.cardSeries}
-                        </span>
-                      </td>
-                      <td className="py-1.5 px-2 max-w-[150px] sm:max-w-[260px]">
-                        <div className="flex items-baseline gap-1.5 min-w-0 truncate">
-                          <span className="font-medium text-slate-900 dark:text-slate-100 truncate">
-                            {r.fullName}
-                          </span>
-                          {r.birthYear && (
-                            <span className="hidden sm:inline text-slate-500 dark:text-slate-400 font-mono tabular-nums shrink-0">
-                              ({r.birthYear})
-                            </span>
-                          )}
-                          <span className="text-slate-300 dark:text-slate-700 shrink-0" aria-hidden="true">
-                            ·
-                          </span>
-                          <span className="text-slate-500 dark:text-slate-400 truncate">
-                            {r.club}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="hidden sm:table-cell py-1.5 px-2 text-slate-600 dark:text-slate-400 whitespace-nowrap">
-                        {r.defaultClassName ?? '—'}
-                      </td>
-                      <td className="hidden md:table-cell py-1.5 px-2 text-slate-500 dark:text-slate-400 whitespace-nowrap">
-                        {formatRunnerSource(r.source)}
-                      </td>
-                      <td className="py-1.5 pl-2 pr-3.5 text-right whitespace-nowrap">
-                        <div className="inline-flex items-center gap-1.5">
-                          {isEntered ? (
-                            <span className="text-[11px] text-slate-400 dark:text-slate-500">
-                              Anmäld
-                            </span>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                lastAutoFilledSiRef.current = null;
-                                setSiInput(String(r.siNumber));
-                                window.scrollTo({ top: 0, behavior: 'smooth' });
-                              }}
-                              className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline whitespace-nowrap"
-                            >
-                              Välj<span className="hidden sm:inline"> till anmälan</span>
-                            </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => void onDeleteRunnerDbEntry(r.id)}
-                            className="p-1 text-slate-400 hover:text-red-600 dark:hover:text-red-400 rounded"
-                            aria-label={`Ta bort ${r.fullName} ur löpardatabasen`}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
       </section>
     </div>
   );

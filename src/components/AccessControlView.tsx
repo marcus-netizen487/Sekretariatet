@@ -105,7 +105,7 @@ interface AccessControlViewProps {
   onUpdateClubSettings?: (settings: ClubSettings) => void;
 }
 
-type AdminWorkspaceTab = 'events' | 'admins' | 'club' | 'rentals_series';
+type AdminWorkspaceTab = 'events' | 'series' | 'admins' | 'club' | 'rentals_series';
 
 const PIN_ROLE_META: {
   role: OfficialPinRole;
@@ -184,7 +184,6 @@ export function AccessControlView({
   const [confirmDeleteEventId, setConfirmDeleteEventId] = useState<string | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState<boolean>(false);
   const [confirmResetSeed, setConfirmResetSeed] = useState<boolean>(false);
-  const [seriesDrafts, setSeriesDrafts] = useState<Record<string, string>>({});
   const [zeroDrafts, setZeroDrafts] = useState<Record<string, string>>({});
   const [eventsNotice, setEventsNotice] = useState<{ ok: boolean; msg: string } | null>(null);
   const [backupBusy, setBackupBusy] = useState<boolean>(false);
@@ -265,6 +264,19 @@ export function AccessControlView({
     ok: boolean;
     msg: string;
   } | null>(null);
+  const [newSeriesName, setNewSeriesName] = useState('');
+  const [newSeriesBusy, setNewSeriesBusy] = useState(false);
+  const [newSeriesNotice, setNewSeriesNotice] = useState<{
+    ok: boolean;
+    msg: string;
+  } | null>(null);
+  const [editingSeriesName, setEditingSeriesName] = useState<string | null>(null);
+  const [seriesNameDraft, setSeriesNameDraft] = useState('');
+  const [renamingSeries, setRenamingSeries] = useState(false);
+  const [renameSeriesNotice, setRenameSeriesNotice] = useState<{
+    ok: boolean;
+    msg: string;
+  } | null>(null);
 
   const isSuperAdmin = currentUser.adminTier === 'SUPER_ADMIN';
   const anyEventHasFees = Boolean(enableFeesAndSwish);
@@ -288,13 +300,10 @@ export function AccessControlView({
   }, [subTab, clubForm, clubSettings]);
 
   useEffect(() => {
-    const nextDrafts: Record<string, string> = {};
     const nextZero: Record<string, string> = {};
     for (const ev of competitionsList) {
-      nextDrafts[ev.id] = ev.seriesName || '';
       nextZero[ev.id] = ev.zeroTimeStr || '18:00:00';
     }
-    setSeriesDrafts(nextDrafts);
     setZeroDrafts(nextZero);
   }, [competitionsList]);
 
@@ -1554,6 +1563,18 @@ export function AccessControlView({
     (activeSeriesBundle &&
       clubSettings.seriesScoringSettings?.[activeSeriesBundle.seriesName]) ??
     DEFAULT_SERIES_SCORING_CONFIG;
+  const availableSeriesNames = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...competitionsList
+            .map((event) => event.seriesName?.trim() ?? '')
+            .filter(Boolean),
+          ...Object.keys(clubSettings.seriesScoringSettings ?? {}),
+        ])
+      ).sort((a, b) => a.localeCompare(b, 'sv')),
+    [clubSettings.seriesScoringSettings, competitionsList]
+  );
 
   useEffect(() => {
     if (!activeSeriesBundle) return;
@@ -1605,6 +1626,7 @@ export function AccessControlView({
       placementPoints,
       participationPoints,
     };
+
     const nextSettings: ClubSettings = {
       ...clubSettings,
       seriesScoringSettings: {
@@ -1663,6 +1685,252 @@ export function AccessControlView({
     }
   };
 
+  const handleCreateSeries = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const seriesName = newSeriesName.trim();
+    if (!seriesName) {
+      setNewSeriesNotice({ ok: false, msg: 'Ange ett serienamn.' });
+      return;
+    }
+    if (seriesName.length > 80) {
+      setNewSeriesNotice({ ok: false, msg: 'Serienamnet får vara högst 80 tecken.' });
+      return;
+    }
+    if (
+      availableSeriesNames.some(
+        (existingName) => existingName.toLocaleLowerCase() === seriesName.toLocaleLowerCase()
+      )
+    ) {
+      setNewSeriesNotice({ ok: false, msg: 'En serie med det namnet finns redan.' });
+      return;
+    }
+
+    const nextSettings: ClubSettings = {
+      ...clubSettings,
+      seriesScoringSettings: {
+        ...clubSettings.seriesScoringSettings,
+        [seriesName]: DEFAULT_SERIES_SCORING_CONFIG,
+      },
+    };
+    setNewSeriesBusy(true);
+    setNewSeriesNotice(null);
+    try {
+      let savedToServer = false;
+      try {
+        const response = await apiFetch('/api/club-settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(nextSettings),
+        });
+        if (response.ok) {
+          savedToServer = true;
+          const stateResponse = await apiFetch('/api/state');
+          if (stateResponse.ok) {
+            onApplyStateSnapshot((await stateResponse.json()) as MeosAppState);
+          }
+        } else if (response.status !== 404 && response.status !== 405) {
+          const errorBody = (await response.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          throw new Error(errorBody.error ?? 'Kunde inte skapa serien.');
+        }
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
+
+      if (auth.currentUser) {
+        await saveClubSettingsToFirestore(nextSettings, isSuperAdmin);
+        const cloudSnapshot = await loadFullSeasonFromFirestore();
+        if (cloudSnapshot) {
+          onApplySeriesScoringUpdate(
+            cloudSnapshot.clubSettings,
+            cloudSnapshot.seriesStandings ?? []
+          );
+        } else {
+          onApplySeriesScoringUpdate(nextSettings, seriesStandings);
+        }
+      } else if (savedToServer) {
+        onUpdateClubSettings?.(nextSettings);
+        onApplySeriesScoringUpdate(nextSettings, seriesStandings);
+      } else {
+        throw new Error('Logga in för att skapa en serie.');
+      }
+
+      setNewSeriesName('');
+      setNewSeriesNotice({ ok: true, msg: `Serien "${seriesName}" har skapats.` });
+    } catch (error) {
+      setNewSeriesNotice({
+        ok: false,
+        msg: error instanceof Error ? error.message : 'Kunde inte skapa serien.',
+      });
+    } finally {
+      setNewSeriesBusy(false);
+    }
+  };
+
+  const handleRenameSeries = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingSeriesName) return;
+
+    const previousName = editingSeriesName;
+    const nextName = seriesNameDraft.trim();
+    if (!nextName) {
+      setRenameSeriesNotice({ ok: false, msg: 'Ange ett serienamn.' });
+      return;
+    }
+    if (nextName.length > 80) {
+      setRenameSeriesNotice({ ok: false, msg: 'Serienamnet får vara högst 80 tecken.' });
+      return;
+    }
+    if (
+      availableSeriesNames.some(
+        (existingName) =>
+          existingName.toLocaleLowerCase() === nextName.toLocaleLowerCase() &&
+          existingName !== previousName
+      )
+    ) {
+      setRenameSeriesNotice({ ok: false, msg: 'En serie med det namnet finns redan.' });
+      return;
+    }
+    if (nextName === previousName) {
+      setEditingSeriesName(null);
+      setRenameSeriesNotice(null);
+      return;
+    }
+
+    const oldSettings = clubSettings;
+    const nextScoringSettings = { ...clubSettings.seriesScoringSettings };
+    if (Object.prototype.hasOwnProperty.call(nextScoringSettings, previousName)) {
+      nextScoringSettings[nextName] = nextScoringSettings[previousName];
+      delete nextScoringSettings[previousName];
+    }
+    const nextSettings: ClubSettings = {
+      ...clubSettings,
+      seriesScoringSettings: nextScoringSettings,
+    };
+    const affectedCompetitions = competitionsList.filter(
+      (event) => event.seriesName?.trim() === previousName
+    );
+    const changedCompetitions: CompetitionSummary[] = [];
+    let serverSettingsSaved = false;
+    let firestoreSettingsSaveAttempted = false;
+    setRenamingSeries(true);
+    setRenameSeriesNotice(null);
+
+    try {
+      for (const event of affectedCompetitions) {
+        changedCompetitions.push(event);
+        await onUpdateCompetitionMeta(event.id, { seriesName: nextName });
+      }
+
+      try {
+        const response = await apiFetch('/api/club-settings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(nextSettings),
+        });
+        if (response.ok) {
+          serverSettingsSaved = true;
+        } else if (response.status !== 404 && response.status !== 405) {
+          const errorBody = (await response.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          throw new Error(errorBody.error ?? 'Kunde inte spara det nya serienamnet.');
+        }
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
+
+      if (auth.currentUser) {
+        firestoreSettingsSaveAttempted = true;
+        await saveClubSettingsToFirestore(nextSettings, isSuperAdmin);
+        const cloudSnapshot = await loadFullSeasonFromFirestore();
+        if (cloudSnapshot) {
+          onApplySeriesScoringUpdate(
+            cloudSnapshot.clubSettings,
+            cloudSnapshot.seriesStandings ?? []
+          );
+        } else {
+          onApplySeriesScoringUpdate(nextSettings, seriesStandings);
+        }
+      } else if (serverSettingsSaved) {
+        onUpdateClubSettings?.(nextSettings);
+      } else {
+        throw new Error('Logga in för att ändra en serie.');
+      }
+
+      try {
+        const stateResponse = await apiFetch('/api/state');
+        if (stateResponse.ok) {
+          onApplyStateSnapshot((await stateResponse.json()) as MeosAppState);
+        }
+      } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+      }
+      setSelectedSeriesName((selected) =>
+        selected === previousName ? nextName : selected
+      );
+      setEditingSeriesName(null);
+      setRenameSeriesNotice({
+        ok: true,
+        msg: `Serien har bytt namn till "${nextName}".`,
+      });
+    } catch (error) {
+      const rollbackErrors: string[] = [];
+      for (const event of changedCompetitions.reverse()) {
+        try {
+          await onUpdateCompetitionMeta(event.id, { seriesName: previousName });
+        } catch (rollbackError) {
+          rollbackErrors.push(
+            rollbackError instanceof Error ? rollbackError.message : `Tävlingen ${event.name}`
+          );
+        }
+      }
+
+      if (serverSettingsSaved) {
+        try {
+          const response = await apiFetch('/api/club-settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(oldSettings),
+          });
+          if (!response.ok) {
+            rollbackErrors.push('Kunde inte återställa serieinställningarna på servern.');
+          }
+        } catch (rollbackError) {
+          rollbackErrors.push(
+            rollbackError instanceof Error
+              ? rollbackError.message
+              : 'Kunde inte återställa serieinställningarna.'
+          );
+        }
+      }
+      if (firestoreSettingsSaveAttempted && auth.currentUser) {
+        try {
+          await saveClubSettingsToFirestore(oldSettings, isSuperAdmin);
+        } catch (rollbackError) {
+          rollbackErrors.push(
+            rollbackError instanceof Error
+              ? rollbackError.message
+              : 'Kunde inte återställa serieinställningarna i Firestore.'
+          );
+        }
+      }
+
+      const message =
+        error instanceof Error ? error.message : 'Kunde inte ändra seriens namn.';
+      setRenameSeriesNotice({
+        ok: false,
+        msg:
+          rollbackErrors.length > 0
+            ? `${message} Återställningen lyckades inte helt: ${rollbackErrors.join('; ')}`
+            : message,
+      });
+    } finally {
+      setRenamingSeries(false);
+    }
+  };
+
   useEffect(() => {
     setSubTab(view === 'events' ? 'events' : 'admins');
   }, [view]);
@@ -1697,14 +1965,41 @@ export function AccessControlView({
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-2.5">
         <div>
           <h1 className="text-lg font-display font-bold text-slate-900 dark:text-slate-100">
-            {view === 'events' ? 'Tävlingar & Säsong' : 'Klubbadmin & Behörighet'}
+            {view === 'events' ? 'Tävlingar och Serier' : 'Klubbadmin & Behörighet'}
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400">
             {view === 'events'
-              ? 'Hantera säsongens tävlingar, träningar, molnsynk och säkerhetskopior.'
+              ? 'Hantera tävlingar, serier, molnsynk och säkerhetskopior.'
               : 'Hantera administratörer, PIN-koder, klubbprofil, hyrbrickor och klubbserier.'}
           </p>
         </div>
+
+        {view === 'events' && (
+          <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setSubTab('events')}
+              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                subTab === 'events'
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-sm'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              Tävlingar
+            </button>
+            <button
+              type="button"
+              onClick={() => setSubTab('series')}
+              className={`px-2.5 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                subTab === 'series'
+                  ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 shadow-sm'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+              }`}
+            >
+              Serier
+            </button>
+          </div>
+        )}
 
         {view === 'admin' && (
           <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-200/70 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg">
@@ -1739,7 +2034,7 @@ export function AccessControlView({
                   : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
               }`}
             >
-              Hyrbrickor ({unreturnedRentalsCount}) & Serie
+              Hyrbrickor ({unreturnedRentalsCount})
             </button>
           </div>
         )}
@@ -1748,7 +2043,7 @@ export function AccessControlView({
       {/* =====================================================================
           TAB 1: TÄVLINGAR, RADERING, MOLNLAGRING & SÄKERHETSKOPIA
          ===================================================================== */}
-      {subTab === 'events' && (
+      {view === 'events' && subTab === 'events' && (
         <div className="space-y-3">
           <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden">
             <div className="px-4 py-2.5 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2.5">
@@ -1953,28 +2248,23 @@ export function AccessControlView({
                           </button>
                         )}
 
-                        <input
-                          type="text"
-                          value={seriesDrafts[ev.id] ?? ''}
+                        <select
+                          value={ev.seriesName || ''}
                           disabled={isBusy}
-                          placeholder="Klubbserie..."
-                          onChange={(e) =>
-                            setSeriesDrafts((prev) => ({ ...prev, [ev.id]: e.target.value }))
-                          }
-                          onBlur={() => {
-                            const draft = (seriesDrafts[ev.id] ?? '').trim();
-                            if (draft !== (ev.seriesName || '')) {
-                              void handleUpdateEventMeta(ev.id, { seriesName: draft });
-                            }
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              e.currentTarget.blur();
-                            }
+                          onChange={(e) => {
+                            const seriesName = e.target.value;
+                            void handleUpdateEventMeta(ev.id, { seriesName });
                           }}
                           aria-label={`Klubbserie för ${ev.name}`}
-                          className="w-28 sm:w-32 px-2 py-1 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-slate-900 dark:text-slate-100"
-                        />
+                          className="w-36 px-2 py-1 text-xs bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md text-slate-900 dark:text-slate-100"
+                        >
+                          <option value="">Ingen serie</option>
+                          {availableSeriesNames.map((seriesName) => (
+                            <option key={seriesName} value={seriesName}>
+                              {seriesName}
+                            </option>
+                          ))}
+                        </select>
 
                         <label
                           title="Aktivera avgiftsuppföljning för denna tävling"
@@ -3007,11 +3297,150 @@ export function AccessControlView({
       )}
 
       {/* =====================================================================
-          TAB 4: UTLÅNADE HYRBRICKOR & KLUBBSERIE / POÄNGTABELL
+          TAB 4: UTLÅNADE HYRBRICKOR & SERIER
          ===================================================================== */}
-      {subTab === 'rentals_series' && (
+      {(subTab === 'rentals_series' || subTab === 'series') && (
         <div className="space-y-3.5">
+          {subTab === 'series' && (
+          <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-3.5">
+            <div className="mb-2">
+              <h2 className="text-sm font-display font-bold text-slate-900 dark:text-slate-100">
+                Serier
+              </h2>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                Skapa en serie här. Därefter kan du välja den vid skapande eller redigering av tävlingar.
+              </p>
+            </div>
+            <form
+              onSubmit={handleCreateSeries}
+              className="flex flex-col sm:flex-row sm:items-end gap-2"
+            >
+              <label className="flex-1 text-[11px] font-medium text-slate-700 dark:text-slate-300">
+                Nytt serienamn
+                <input
+                  type="text"
+                  value={newSeriesName}
+                  maxLength={80}
+                  onChange={(event) => setNewSeriesName(event.target.value)}
+                  placeholder="t.ex. Höstserien 2026"
+                  className="mt-1 w-full px-2.5 py-1.5 text-xs bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg"
+                />
+              </label>
+              <button
+                type="submit"
+                disabled={newSeriesBusy}
+                className="px-3 py-1.5 text-xs font-semibold club-accent-btn disabled:opacity-50 rounded-lg whitespace-nowrap"
+              >
+                {newSeriesBusy ? 'Skapar...' : 'Skapa serie'}
+              </button>
+            </form>
+            {newSeriesNotice && (
+              <p
+                role="status"
+                className={`mt-2 text-xs ${
+                  newSeriesNotice.ok
+                    ? 'text-emerald-700 dark:text-emerald-400'
+                    : 'text-red-700 dark:text-red-400'
+                }`}
+              >
+                {newSeriesNotice.msg}
+              </p>
+            )}
+            {renameSeriesNotice && (
+              <p
+                role="status"
+                className={`mt-2 text-xs ${
+                  renameSeriesNotice.ok
+                    ? 'text-emerald-700 dark:text-emerald-400'
+                    : 'text-red-700 dark:text-red-400'
+                }`}
+              >
+                {renameSeriesNotice.msg}
+              </p>
+            )}
+            {availableSeriesNames.length > 0 && (
+              <ul className="mt-3 divide-y divide-slate-200 dark:divide-slate-800 border-y border-slate-200 dark:border-slate-800">
+                {availableSeriesNames.map((seriesName) => {
+                  const linkedCompetitions = competitionsList.filter(
+                    (event) => event.seriesName?.trim() === seriesName
+                  ).length;
+                  const isEditing = editingSeriesName === seriesName;
+                  return (
+                    <li
+                      key={seriesName}
+                      className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 py-2"
+                    >
+                      {isEditing ? (
+                        <form
+                          onSubmit={handleRenameSeries}
+                          className="flex flex-1 flex-col sm:flex-row sm:items-center gap-2"
+                        >
+                          <label className="flex-1 text-[11px] font-medium text-slate-700 dark:text-slate-300">
+                            Nytt namn för {seriesName}
+                            <input
+                              autoFocus
+                              type="text"
+                              value={seriesNameDraft}
+                              maxLength={80}
+                              onChange={(event) => setSeriesNameDraft(event.target.value)}
+                              className="mt-1 w-full px-2.5 py-1.5 text-xs bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg"
+                            />
+                          </label>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="submit"
+                              disabled={renamingSeries}
+                              className="px-3 py-1.5 text-xs font-semibold club-accent-btn disabled:opacity-50 rounded-lg whitespace-nowrap"
+                            >
+                              {renamingSeries ? 'Sparar...' : 'Spara namn'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={renamingSeries}
+                              onClick={() => {
+                                setEditingSeriesName(null);
+                                setRenameSeriesNotice(null);
+                              }}
+                              className="px-3 py-1.5 text-xs font-medium text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 rounded-lg whitespace-nowrap disabled:opacity-50"
+                            >
+                              Avbryt
+                            </button>
+                          </div>
+                        </form>
+                      ) : (
+                        <>
+                          <div className="min-w-0">
+                            <span className="text-xs font-medium text-slate-900 dark:text-slate-100">
+                              {seriesName}
+                            </span>
+                            <span className="ml-2 text-[11px] text-slate-500 dark:text-slate-400">
+                              {linkedCompetitions} tävlingar
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={renamingSeries}
+                            onClick={() => {
+                              setEditingSeriesName(seriesName);
+                              setSeriesNameDraft(seriesName);
+                              setRenameSeriesNotice(null);
+                            }}
+                            className="self-start sm:self-auto px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800 rounded-lg whitespace-nowrap disabled:opacity-50"
+                          >
+                            Ändra
+                          </button>
+                        </>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </section>
+          )}
+
           {/* Rental SI-Card Follow-Up Across Entire Season */}
+          {subTab === 'rentals_series' && (
           <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2.5">
               <div className="min-w-0">
@@ -3119,8 +3548,10 @@ export function AccessControlView({
               </div>
             )}
           </section>
+          )}
 
           {/* Club Series Standings (O-Tid Multi-Stage Leaderboard) */}
+          {subTab === 'series' && (
           <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
             <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-2.5">
               <div className="min-w-0">
@@ -3154,7 +3585,8 @@ export function AccessControlView({
             {!activeSeriesBundle ? (
               <div className="px-4 py-3 text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
                 Ingen klubbserie finns ännu. Ange ett gemensamt serienamn på tävlingarna under{' '}
-                <em>Tävlingar & Säsong</em>. Därefter kan du välja poängmodell för serien här.
+                <em>Tävlingar och Serier</em>. Lägg till tävlingar där och välj sedan poängmodell
+                för serien här.
               </div>
             ) : (
               <div className="p-3.5 space-y-2.5">
@@ -3338,6 +3770,7 @@ export function AccessControlView({
               </div>
             )}
           </section>
+          )}
         </div>
       )}
     </div>

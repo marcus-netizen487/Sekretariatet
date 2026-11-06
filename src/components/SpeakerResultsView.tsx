@@ -227,6 +227,7 @@ export function SpeakerResultsView({
         classes={classes}
         courses={courses}
         competitors={competitors}
+        radioControls={stations}
         selectedClassId={selectedClassId}
         onSelectClassId={setSelectedClassId}
         liveUpdates

@@ -55,6 +55,8 @@ const SIM_OFFLINE_KEY = 'passersi_simulate_offline_forest';
 const IDB_NAME = 'PasserSI_ForestQueueDB';
 const IDB_STORE = 'pending_readouts';
 const DELIVERY_TIMEOUT_MS = 30_000;
+const INITIAL_RETRY_DELAY_MS = 4_000;
+const MAX_RETRY_DELAY_MS = 60_000;
 
 type SnapshotListener = (snap: OfflineQueueSnapshot) => void;
 type SyncedResultListener = (res: ReadoutDeliveryResult) => void;
@@ -70,6 +72,8 @@ class OfflineReadoutQueueManager {
   private listeners = new Set<SnapshotListener>();
   private syncedListeners = new Set<SyncedResultListener>();
   private retryTimer: ReturnType<typeof setInterval> | null = null;
+  private retryDelayMs = INITIAL_RETRY_DELAY_MS;
+  private nextRetryAt = 0;
 
   constructor() {
     if (typeof window !== 'undefined') {
@@ -93,7 +97,7 @@ class OfflineReadoutQueueManager {
           this.items.length > 0 &&
           !this.simulatedOffline &&
           this.browserOnline &&
-          !this.lastError
+          Date.now() >= this.nextRetryAt
         ) {
           void this.flushQueue();
         }
@@ -198,6 +202,22 @@ class OfflineReadoutQueueManager {
   private emit(): void {
     const snap = this.getSnapshot();
     this.listeners.forEach((cb) => cb(snap));
+  }
+
+  private recordDeliverySuccess(): void {
+    this.lastError = null;
+    this.retryDelayMs = INITIAL_RETRY_DELAY_MS;
+    this.nextRetryAt = 0;
+  }
+
+  private recordDeliveryFailure(error: unknown): void {
+    this.lastError =
+      error instanceof Error
+        ? `Firestore kunde inte synka avläsningen: ${error.message}`
+        : 'Firestore kunde inte synka avläsningen.';
+    this.nextRetryAt = Date.now() + this.retryDelayMs;
+    this.retryDelayMs = Math.min(this.retryDelayMs * 2, MAX_RETRY_DELAY_MS);
+    this.emit();
   }
 
   public setSimulatedOffline(offline: boolean): void {
@@ -332,7 +352,7 @@ class OfflineReadoutQueueManager {
         const data = await this.withDeliveryTimeout(
           submitReadoutToFirestore(item.eventId, item.readoutPayload)
         );
-        this.lastError = null;
+        this.recordDeliverySuccess();
         return { queuedOffline: false, ...data };
       }
 
@@ -341,7 +361,7 @@ class OfflineReadoutQueueManager {
         await this.withDeliveryTimeout(
           submitOnlinePunchToFirestore(item.eventId, item.onlinePunchPayload)
         );
-        this.lastError = null;
+        this.recordDeliverySuccess();
         return { queuedOffline: false };
       }
 
@@ -349,11 +369,7 @@ class OfflineReadoutQueueManager {
       this.emit();
       return null;
     } catch (error) {
-      this.lastError =
-        error instanceof Error
-          ? `Firestore kunde inte synka avläsningen: ${error.message}`
-          : 'Firestore kunde inte synka avläsningen.';
-      this.emit();
+      this.recordDeliveryFailure(error);
       return null;
     }
   }
@@ -397,6 +413,9 @@ class OfflineReadoutQueueManager {
 
   public clearQueue(): void {
     this.items = [];
+    this.lastError = null;
+    this.retryDelayMs = INITIAL_RETRY_DELAY_MS;
+    this.nextRetryAt = 0;
     this.persistAll();
     this.emit();
   }

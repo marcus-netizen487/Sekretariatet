@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Binary,
   Clock,
   ExternalLink,
+  Pencil,
   Plus,
   Radio,
   RefreshCw,
@@ -59,6 +60,7 @@ interface HardwareStationsViewProps {
   onRequestSysConfig: () => Promise<void>;
   onTriggerStationBeep: () => Promise<void>;
   onCreateStation: (payload: Partial<SIStation>) => Promise<string | null>;
+  onSaveStation: (payload: Partial<SIStation>) => Promise<string | null>;
   onDeleteStation: (id: string) => Promise<void>;
   onOpenProtocolInspector?: () => void;
 }
@@ -106,6 +108,7 @@ export function HardwareStationsView({
   onRequestSysConfig,
   onTriggerStationBeep,
   onCreateStation,
+  onSaveStation,
   onDeleteStation,
   onOpenProtocolInspector,
 }: HardwareStationsViewProps) {
@@ -114,8 +117,16 @@ export function HardwareStationsView({
   const [stationCode, setStationCode] = useState('73');
   const [stationName, setStationName] = useState('');
   const [hardwareModel, setHardwareModel] = useState<HardwareModel>('BSM8-USB');
-  const [stationFunction, setStationFunction] = useState<StationFunction>('READOUT');
+  const [stationFunction, setStationFunction] = useState<StationFunction>('RADIO');
+  const [editingStationId, setEditingStationId] = useState<string | null>(null);
   const [stationErr, setStationErr] = useState<string | null>(null);
+  const stationFormRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (modalOpen) {
+      stationFormRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }, [modalOpen, editingStationId]);
 
   // Emergency Form State
   const [brokenCodeInput, setBrokenCodeInput] = useState<string>('');
@@ -137,19 +148,50 @@ export function HardwareStationsView({
   const handleCreateStationSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setStationErr(null);
-    const err = await onCreateStation({
-      stationCode: Number(stationCode),
-      name: stationName.trim(),
-      hardwareModel,
-      stationFunction,
-      baudRate: 38400,
-    });
-    if (err) {
-      setStationErr(err);
-    } else {
-      setStationName('');
-      setModalOpen(false);
+    try {
+      const payload: Partial<SIStation> = {
+        ...(editingStationId ? { id: editingStationId } : {}),
+        stationCode: Number(stationCode),
+        name: stationName.trim(),
+        hardwareModel,
+        stationFunction,
+        baudRate: 38400,
+      };
+      const err = editingStationId
+        ? await onSaveStation(payload)
+        : await onCreateStation(payload);
+      if (err) {
+        setStationErr(err);
+      } else {
+        setStationName('');
+        setEditingStationId(null);
+        setModalOpen(false);
+      }
+    } catch (error) {
+      setStationErr(
+        error instanceof Error ? error.message : 'Kunde inte spara stationen.'
+      );
     }
+  };
+
+  const handleEditStation = (station: SIStation) => {
+    setEditingStationId(station.id);
+    setStationCode(String(station.stationCode));
+    setStationName(station.name);
+    setHardwareModel(station.hardwareModel);
+    setStationFunction(station.stationFunction);
+    setStationErr(null);
+    setModalOpen(true);
+  };
+
+  const handleOpenNewStation = () => {
+    setEditingStationId(null);
+    setStationCode('73');
+    setStationName('');
+    setHardwareModel('BSM8-USB');
+    setStationFunction('RADIO');
+    setStationErr(null);
+    setModalOpen(true);
   };
 
   const handleAddBrokenControl = async (e: React.FormEvent) => {
@@ -335,24 +377,19 @@ export function HardwareStationsView({
             </button>
           )}
 
-          {isAdmin && (
-            <button
-              type="button"
-              onClick={() => setModalOpen((v) => !v)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors whitespace-nowrap"
-            >
-              {modalOpen ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
-              <span>{modalOpen ? 'Stäng formulär' : 'Ny SI-station'}</span>
-            </button>
-          )}
         </div>
       </div>
 
       {modalOpen && (
-        <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
+        <section
+          ref={stationFormRef}
+          className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden"
+        >
           <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-800">
             <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
-              Lägg till SI-station / Radiokontroll
+              {editingStationId
+                ? 'Ändra SI-station / Radiokontroll'
+                : 'Lägg till SI-station / Radiokontroll'}
             </h2>
             <button
               type="button"
@@ -377,7 +414,7 @@ export function HardwareStationsView({
                 <input
                   type="number"
                   min={1}
-                  max={999}
+                  max={511}
                   value={stationCode}
                   onChange={(e) => setStationCode(e.target.value)}
                   className="w-full px-2.5 py-1.5 text-xs font-mono bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg"
@@ -426,7 +463,7 @@ export function HardwareStationsView({
                 type="submit"
                 className="px-3.5 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg"
               >
-                Skapa station
+                {editingStationId ? 'Spara ändringar' : 'Lägg till station'}
               </button>
             </div>
           </form>
@@ -869,10 +906,26 @@ export function HardwareStationsView({
 
       {/* 4. Konfigurerade SI-stationer & Radiokontroller */}
       <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl overflow-hidden">
-        <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between">
+        <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2">
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
             Konfigurerade SI-stationer & Radiokontroller ({stations.length})
           </h2>
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={handleOpenNewStation}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors whitespace-nowrap"
+            >
+              {modalOpen && !editingStationId ? (
+                <X className="w-3.5 h-3.5" />
+              ) : (
+                <Plus className="w-3.5 h-3.5" />
+              )}
+              <span>
+                {modalOpen && !editingStationId ? 'Stäng formulär' : 'Lägg till station'}
+              </span>
+            </button>
+          )}
         </div>
 
         <div className="overflow-x-auto">
@@ -916,14 +969,26 @@ export function HardwareStationsView({
                     </td>
                     <td className="px-4 py-2.5 text-right">
                       {isAdmin && (
-                        <button
-                          type="button"
-                          onClick={() => void onDeleteStation(st.id)}
-                          className="p-1 text-slate-400 hover:text-red-600 rounded transition-colors"
-                          title="Ta bort station"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleEditStation(st)}
+                            className="p-1 text-slate-400 hover:text-blue-600 rounded transition-colors"
+                            title="Ändra station"
+                            aria-label={`Ändra station ${st.name}`}
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void onDeleteStation(st.id)}
+                            className="p-1 text-slate-400 hover:text-red-600 rounded transition-colors"
+                            title="Ta bort station"
+                            aria-label={`Ta bort station ${st.name}`}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       )}
                     </td>
                   </tr>

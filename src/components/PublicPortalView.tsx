@@ -795,9 +795,12 @@ export function PublicPortalView({
                     }
                     courses={raceData.courses}
                     competitors={filteredCompetitors}
+                    radioControls={raceData.radioControls}
                     selectedClassId={selectedClassId}
                     onSelectClassId={setSelectedClassId}
                     onSelectClub={setSelectedClubName}
+                    liveUpdates
+                    liveUpdateScope={raceData.competition.id}
                   />
                 ) : (
                   <div className="space-y-2.5">

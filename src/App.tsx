@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   Binary,
   CloudOff,
   Compass,
+  Database,
   Eye,
   FolderPlus,
   GitBranch,
@@ -107,6 +108,8 @@ import {
   updateCompetitorInFirestore,
   deleteCompetitorFromFirestore,
   deleteRunnerDbEntryFromFirestore,
+  saveRunnerDbEntriesToFirestore,
+  updateRunnerDbEntryInFirestore,
   recalculateCompetitionFromFirestore,
   auth,
   googleProvider,
@@ -120,6 +123,7 @@ import { ReadoutDashboard } from './components/ReadoutDashboard';
 import { ForestSafetyView } from './components/ForestSafetyView';
 import { SpeakerResultsView } from './components/SpeakerResultsView';
 import { EntriesRegistrationView } from './components/EntriesRegistrationView';
+import { RunnerDatabaseView } from './components/RunnerDatabaseView';
 import { DrawView } from './components/DrawView';
 import { CompetitionSettingsView } from './components/CompetitionSettingsView';
 import { CoursesClassesView } from './components/CoursesClassesView';
@@ -148,6 +152,7 @@ type MeosTab =
   | 'draw'
   | 'hardware'
   | 'season'
+  | 'runner_db'
   | 'access'
   | 'protocol';
 
@@ -190,7 +195,8 @@ const NAV_ITEMS: {
   { id: 'results', label: 'Speaker & Resultat', icon: Mic },
   { id: 'draw', label: 'Lottning', icon: Shuffle },
   { id: 'hardware', label: 'SportIdent, ROC & USB', icon: Radio },
-  { id: 'season', label: 'Tävlingar & Säsong', icon: Trophy },
+  { id: 'season', label: 'Tävlingar och Serier', icon: Trophy },
+  { id: 'runner_db', label: 'Löpardatabas', icon: Database },
   { id: 'access', label: 'Klubbadmin och behörighet', icon: KeyRound },
 ];
 
@@ -214,6 +220,7 @@ const ROLE_ALLOWED_TABS: Record<OfficialRoleMode, MeosTab[]> = {
     'draw',
     'hardware',
     'season',
+    'runner_db',
     'access',
     'protocol',
   ],
@@ -533,6 +540,18 @@ export default function App() {
     missingRentalFeeSek: 0,
   });
   const [logoBroken, setLogoBroken] = useState<boolean>(false);
+  const availableSeriesNames = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...competitionsList
+            .map((item) => item.seriesName?.trim() ?? '')
+            .filter(Boolean),
+          ...Object.keys(clubSettings.seriesScoringSettings ?? {}),
+        ])
+      ).sort((a, b) => a.localeCompare(b, 'sv')),
+    [clubSettings.seriesScoringSettings, competitionsList]
+  );
 
   useEffect(() => {
     const unsubscribe = subscribeClubSettingsFromFirestore((settings) => {
@@ -567,6 +586,7 @@ export default function App() {
   const [stations, setStations] = useState<SIStation[]>([]);
   const [competitors, setCompetitors] = useState<Competitor[]>([]);
   const [runnerDb, setRunnerDb] = useState<RunnerDbEntry[]>([]);
+  const [runnerForDirectEntry, setRunnerForDirectEntry] = useState<number | null>(null);
   useEffect(() => {
     if (
       !firebaseUserUid ||
@@ -2239,15 +2259,25 @@ export default function App() {
                   </div>
                   <div>
                     <label className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1">
-                      Klubbserie (valfritt)
+                      Serie (valfritt)
                     </label>
-                    <input
-                      type="text"
+                    <select
                       value={newEvtSeriesName}
                       onChange={(e) => setNewEvtSeriesName(e.target.value)}
-                      placeholder="t.ex. Höstserien 2026"
                       className="w-full px-2.5 py-1.5 text-xs sm:text-sm bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded-lg text-slate-900 dark:text-slate-100"
-                    />
+                    >
+                      <option value="">Ingen serie</option>
+                      {availableSeriesNames.map((seriesName) => (
+                        <option key={seriesName} value={seriesName}>
+                          {seriesName}
+                        </option>
+                      ))}
+                    </select>
+                    {availableSeriesNames.length === 0 && (
+                      <p className="mt-1 text-[10px] text-slate-500">
+                        Skapa serier under Tävlingar och Serier → Serier.
+                      </p>
+                    )}
                   </div>
                   <div>
                     <label className="block text-[11px] font-medium text-slate-700 dark:text-slate-300 mb-1">
@@ -2437,6 +2467,7 @@ export default function App() {
             competitionsList.length === 0 &&
             activeTab !== 'access' &&
             activeTab !== 'season' &&
+            activeTab !== 'runner_db' &&
             activeTab !== 'protocol' ? (
             <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 max-w-2xl">
               <h1 className="text-lg font-display font-bold text-slate-900 dark:text-slate-100">
@@ -3230,10 +3261,25 @@ export default function App() {
                       current.filter((competitor) => competitor.id !== id)
                     );
                   }}
+                  initialSiNumber={runnerForDirectEntry}
+                  onInitialSiNumberConsumed={() => setRunnerForDirectEntry(null)}
+                />
+              )}
+
+              {activeTab === 'runner_db' && isAdminSession && (
+                <RunnerDatabaseView
+                  runnerDb={runnerDb}
+                  enteredSiNumbers={competitors.map((competitor) => competitor.siNumber)}
+                  canSelectForEntry={!isEmptySeason}
+                  onSelectForEntry={(siNumber) => {
+                    setRunnerForDirectEntry(siNumber);
+                    setActiveTab('entries');
+                  }}
                   onImportRunnerDb={async (runners, source) => {
-                    let res: Response | null = null;
+                    let response: Response | null = null;
+                    let importedRunners: RunnerDbEntry[] | null = null;
                     try {
-                      res = await apiFetch('/api/runner-db/import', {
+                      response = await apiFetch('/api/runner-db/import', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ runners, source }),
@@ -3241,61 +3287,116 @@ export default function App() {
                     } catch (error) {
                       if (!(error instanceof TypeError)) throw error;
                     }
-                    if (res?.ok) {
-                      return (await res.json()) as {
+                    let importedCount = runners.length;
+                    if (response?.ok) {
+                      const result = (await response.json()) as {
                         importedCount: number;
                         totalRunnerDb: number;
+                        importedRunners?: RunnerDbEntry[];
                       };
-                    }
-                    if (res && res.status !== 404 && res.status !== 405) {
-                      const errorBody = (await res.json().catch(() => ({}))) as {
+                      importedCount = result.importedCount;
+                      importedRunners = result.importedRunners ?? null;
+                    } else if (response && response.status !== 404 && response.status !== 405) {
+                      const errorBody = (await response.json().catch(() => ({}))) as {
                         error?: string;
                       };
                       throw new Error(errorBody.error ?? 'Kunde inte importera löpardatabasen.');
+                    } else {
+                      const imported: RunnerDbEntry[] = runners.map((runner) => ({
+                        id: String(runner.siNumber),
+                        siNumber: runner.siNumber,
+                        cardSeries: inferCardSeries(runner.siNumber),
+                        fullName: runner.fullName,
+                        club: runner.club,
+                        birthYear: runner.birthYear ?? null,
+                        defaultClassName: runner.defaultClassName ?? null,
+                        eventorPersonId: null,
+                        eventorOrgId: null,
+                        source,
+                        updatedAt: new Date().toISOString(),
+                      }));
+                      await saveRunnerDbEntriesToFirestore(imported);
                     }
-                    const nowIso = new Date().toISOString();
-                    const imported: RunnerDbEntry[] = runners.map((runner) => ({
-                      id: `rdb_${runner.siNumber}`,
-                      siNumber: runner.siNumber,
-                      cardSeries: inferCardSeries(runner.siNumber),
-                      fullName: runner.fullName,
-                      club: runner.club,
-                      birthYear: runner.birthYear ?? null,
-                      defaultClassName: runner.defaultClassName ?? null,
-                      eventorPersonId: null,
-                      eventorOrgId: null,
-                      source,
-                      updatedAt: nowIso,
-                    }));
-                    await saveCompetitionImportToFirestore({
-                      competitionId: activeEventId,
-                      courses,
-                      classes,
-                      competitors,
-                      runnerDbEntries: imported,
-                      competitorCount: competitors.length,
-                    });
                     const bySiNumber = new Map(
                       runnerDb.map((runner) => [runner.siNumber, runner])
                     );
-                    for (const runner of imported) bySiNumber.set(runner.siNumber, runner);
-                    setRunnerDb(Array.from(bySiNumber.values()));
-                    return {
-                      importedCount: imported.length,
-                      totalRunnerDb: bySiNumber.size,
+                    if (importedRunners) {
+                      for (const runner of importedRunners) {
+                        bySiNumber.set(runner.siNumber, runner);
+                      }
+                    } else {
+                      for (const runner of runners) {
+                        const existing = bySiNumber.get(runner.siNumber);
+                        bySiNumber.set(runner.siNumber, {
+                          id: existing?.id ?? String(runner.siNumber),
+                          siNumber: runner.siNumber,
+                          cardSeries: inferCardSeries(runner.siNumber),
+                          fullName: runner.fullName,
+                          club: runner.club,
+                          birthYear: runner.birthYear ?? existing?.birthYear ?? null,
+                          defaultClassName:
+                            runner.defaultClassName ?? existing?.defaultClassName ?? null,
+                          eventorPersonId: existing?.eventorPersonId ?? null,
+                          eventorOrgId: existing?.eventorOrgId ?? null,
+                          source,
+                          updatedAt: new Date().toISOString(),
+                        });
+                      }
+                    }
+                    const nextRunnerDb = Array.from(bySiNumber.values());
+                    setRunnerDb(nextRunnerDb);
+                    return { importedCount, totalRunnerDb: nextRunnerDb.length };
+                  }}
+                  onUpdateRunnerDbEntry={async (id, patch) => {
+                    const existing = runnerDb.find((runner) => runner.id === id);
+                    if (!existing) throw new Error('Löparen hittades inte i databasen.');
+                    const updated: RunnerDbEntry = {
+                      ...existing,
+                      ...patch,
+                      id:
+                        patch.siNumber === existing.siNumber
+                          ? existing.id
+                          : String(patch.siNumber),
+                      cardSeries: inferCardSeries(patch.siNumber),
+                      updatedAt: new Date().toISOString(),
                     };
+                    let response: Response | null = null;
+                    try {
+                      response = await apiFetch(`/api/runner-db/${encodeURIComponent(id)}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(patch),
+                      });
+                    } catch (error) {
+                      if (!(error instanceof TypeError)) throw error;
+                    }
+                    if (response?.ok) {
+                      const saved = (await response.json()) as RunnerDbEntry;
+                      Object.assign(updated, saved);
+                    } else if (response && response.status !== 404 && response.status !== 405) {
+                      const errorBody = (await response.json().catch(() => ({}))) as {
+                        error?: string;
+                      };
+                      throw new Error(errorBody.error ?? 'Kunde inte spara löparuppgifterna.');
+                    } else {
+                      await updateRunnerDbEntryInFirestore(existing.siNumber, updated);
+                    }
+                    setRunnerDb((current) =>
+                      current.map((runner) => (runner.id === id ? updated : runner))
+                    );
                   }}
                   onDeleteRunnerDbEntry={async (id) => {
                     const useFirestore = await apiRequestUnavailable(
-                      `/api/runner-db/${id}`,
+                      `/api/runner-db/${encodeURIComponent(id)}`,
                       { method: 'DELETE' },
                       'Kunde inte ta bort löparen.'
                     );
-                    if (!useFirestore) return;
-                    await deleteRunnerDbEntryFromFirestore(Number(id));
-                    setRunnerDb((current) =>
-                      current.filter((runner) => runner.siNumber !== Number(id))
-                    );
+                    if (useFirestore) {
+                      const runner = runnerDb.find((candidate) => candidate.id === id);
+                      if (!runner) throw new Error('Löparen hittades inte i databasen.');
+                      await deleteRunnerDbEntryFromFirestore(runner.siNumber);
+                    }
+                    setRunnerDb((current) => current.filter((runner) => runner.id !== id));
                   }}
                 />
               )}
@@ -3703,6 +3804,43 @@ export default function App() {
                       return null;
                     } catch (error) {
                       return error instanceof Error ? error.message : 'Kunde inte spara station.';
+                    }
+                  }}
+                  onSaveStation={async (payload) => {
+                    if (!payload.id) return 'Stationens ID saknas.';
+                    try {
+                      const useFirestore = await apiRequestUnavailable(
+                        `/api/stations/${encodeURIComponent(payload.id)}`,
+                        {
+                          method: 'PUT',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify(payload),
+                        },
+                        'Kunde inte uppdatera stationen.'
+                      );
+                      if (useFirestore) {
+                        const saved = await saveStationToFirestore(activeEventId, payload);
+                        setStations((current) =>
+                          current
+                            .map((station) => (station.id === saved.id ? saved : station))
+                            .sort((a, b) => a.stationCode - b.stationCode)
+                        );
+                      } else {
+                        setStations((current) =>
+                          current
+                            .map((station) =>
+                              station.id === payload.id
+                                ? { ...station, ...payload }
+                                : station
+                            )
+                            .sort((a, b) => a.stationCode - b.stationCode)
+                        );
+                      }
+                      return null;
+                    } catch (error) {
+                      return error instanceof Error
+                        ? error.message
+                        : 'Kunde inte uppdatera stationen.';
                     }
                   }}
                   onDeleteStation={async (id) => {

@@ -406,6 +406,7 @@ export interface PublicRacePayload {
   courses: Course[];
   classes: CompClass[];
   competitors: Competitor[];
+  radioControls?: Pick<SIStation, 'stationCode' | 'name' | 'stationFunction' | 'active'>[];
   events: LiveEventItem[];
   emergency: EmergencySettings;
   competitionsList: CompetitionSummary[];

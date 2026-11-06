@@ -2769,6 +2769,148 @@ export async function deleteRunnerDbEntryFromFirestore(siNumber: number): Promis
   await deleteDoc(doc(db, 'runnerDb', String(siNumber)));
 }
 
+async function ensureRunnerDbAdmin(): Promise<User> {
+  const current = await ensureValidFirestoreUser();
+  if (
+    !current ||
+    !current.emailVerified ||
+    !current.providerData.some((provider) => provider.providerId === 'google.com')
+  ) {
+    throw new Error('Löpardatabasen kräver ett inloggat, verifierat Google-administratörskonto.');
+  }
+  const isBootstrapAdmin = BOOTSTRAP_SUPER_ADMIN_EMAILS.includes(
+    (current.email || '').toLowerCase()
+  );
+  const adminSnap = isBootstrapAdmin
+    ? null
+    : await getDoc(doc(db, 'admins', sanitizeFirestoreId(current.uid, 'usr')));
+  const role = adminSnap?.exists() ? adminSnap.data().role : null;
+  if (!isBootstrapAdmin && role !== 'RACE_ADMIN' && role !== 'SUPER_ADMIN') {
+    throw new Error('Ditt Google-konto saknar administratörsbehörighet för löpardatabasen.');
+  }
+  return current;
+}
+
+function runnerDbFirestoreFields(runner: RunnerDbEntry) {
+  return {
+    siNumber: runner.siNumber,
+    cardSeries: runner.cardSeries,
+    fullName: runner.fullName.trim().slice(0, 120),
+    club: runner.club.trim().slice(0, 100),
+    birthYear: runner.birthYear,
+    defaultClassName: (runner.defaultClassName || '').trim().slice(0, 80),
+    eventorPersonId: (runner.eventorPersonId || '').trim().slice(0, 128),
+    eventorOrgId: (runner.eventorOrgId || '').trim().slice(0, 32),
+    source: runner.source,
+    updatedAtIso: runner.updatedAt,
+  };
+}
+
+export async function saveRunnerDbEntriesToFirestore(
+  runners: RunnerDbEntry[]
+): Promise<void> {
+  const current = await ensureRunnerDbAdmin();
+  const ownerUid = sanitizeFirestoreId(current.uid, 'usr');
+  const isBootstrapAdmin = BOOTSTRAP_SUPER_ADMIN_EMAILS.includes(
+    (current.email || '').toLowerCase()
+  );
+  const adminSnap = isBootstrapAdmin
+    ? null
+    : await getDoc(doc(db, 'admins', ownerUid));
+  const isSuperAdmin = isBootstrapAdmin || adminSnap?.data().role === 'SUPER_ADMIN';
+  for (let offset = 0; offset < runners.length; offset += 400) {
+    const batch = writeBatch(db);
+    for (const runner of runners.slice(offset, offset + 400)) {
+      if (
+        !Number.isInteger(runner.siNumber) ||
+        runner.siNumber < 1 ||
+        runner.siNumber > 99999999 ||
+        !runner.fullName.trim()
+      ) {
+        continue;
+      }
+      const id = String(runner.siNumber);
+      const runnerRef = doc(db, 'runnerDb', id);
+      const existing = await getDoc(runnerRef);
+      if (
+        existing.exists() &&
+        existing.data().ownerUid !== ownerUid &&
+        !isSuperAdmin
+      ) {
+        throw new Error('Importerad löpare tillhör ett annat konto.');
+      }
+      batch.set(
+        runnerRef,
+        {
+          runnerId: id,
+          ...runnerDbFirestoreFields(runner),
+          ownerUid,
+          ...(!existing.exists() ? { createdAt: serverTimestamp() } : {}),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+    await batch.commit();
+  }
+}
+
+export async function updateRunnerDbEntryInFirestore(
+  previousSiNumber: number,
+  runner: RunnerDbEntry
+): Promise<void> {
+  const current = await ensureRunnerDbAdmin();
+  if (
+    !Number.isInteger(previousSiNumber) ||
+    previousSiNumber < 1 ||
+    previousSiNumber > 99999999 ||
+    !Number.isInteger(runner.siNumber) ||
+    runner.siNumber < 1 ||
+    runner.siNumber > 99999999 ||
+    !runner.fullName.trim()
+  ) {
+    throw new Error('Ange ett giltigt namn och SI-bricknummer.');
+  }
+
+  const previousRef = doc(db, 'runnerDb', String(previousSiNumber));
+  const nextRef = doc(db, 'runnerDb', String(runner.siNumber));
+  const [previousSnap, nextSnap] = await Promise.all([getDoc(previousRef), getDoc(nextRef)]);
+  if (!previousSnap.exists()) {
+    throw new Error('Löparen hittades inte i Firestore.');
+  }
+  const ownerUid = sanitizeFirestoreId(current.uid, 'usr');
+  const isBootstrapAdmin = BOOTSTRAP_SUPER_ADMIN_EMAILS.includes(
+    (current.email || '').toLowerCase()
+  );
+  const adminSnap = isBootstrapAdmin
+    ? null
+    : await getDoc(doc(db, 'admins', ownerUid));
+  const isSuperAdmin = isBootstrapAdmin || adminSnap?.data().role === 'SUPER_ADMIN';
+  if (previousSnap.data().ownerUid !== ownerUid && !isSuperAdmin) {
+    throw new Error('Du saknar behörighet att ändra den här löparen.');
+  }
+  if (previousSiNumber !== runner.siNumber && nextSnap.exists()) {
+    throw new Error('SI-bricknumret finns redan i löpardatabasen.');
+  }
+
+  const batch = writeBatch(db);
+  batch.set(
+    nextRef,
+    {
+      runnerId: String(runner.siNumber),
+      ...runnerDbFirestoreFields(runner),
+      ownerUid,
+      ...(previousSiNumber !== runner.siNumber
+        ? { createdAt: serverTimestamp() }
+        : {}),
+      updatedAt: serverTimestamp(),
+    },
+    { merge: true }
+  );
+  if (previousSiNumber !== runner.siNumber) batch.delete(previousRef);
+  await batch.commit();
+}
+
 export async function recalculateCompetitionFromFirestore(
   competitionId: string,
   patch?: Partial<EmergencySettings>
@@ -3648,6 +3790,18 @@ export async function loadPublicRaceFromFirestore(
       ? target.classes
       : target.classes.map((compClass) => ({ ...compClass, feeSek: 0 })),
     competitors: target.competitors,
+    radioControls: (target.stations ?? [])
+      .filter(
+        (station) =>
+          station.active &&
+          (station.stationFunction === 'RADIO' || station.stationFunction === 'PREWARNING')
+      )
+      .map(({ stationCode, name, stationFunction, active }) => ({
+        stationCode,
+        name,
+        stationFunction,
+        active,
+      })),
     events: [],
     emergency: {
       brokenControls: target.brokenControls,
